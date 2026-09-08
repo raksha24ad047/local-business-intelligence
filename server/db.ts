@@ -15,6 +15,7 @@ import {
   type InsertUser,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import { aggregateCustomerMetrics, calculateGrowth } from "./business-logic";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -146,6 +147,32 @@ export async function getDashboardSnapshot(userId: number) {
     { revenue: 0, profit: 0, quantity: 0 },
   );
 
+  const now = Date.now();
+  const currentPeriodStart = now - 30 * 24 * 60 * 60 * 1000;
+  const priorPeriodStart = now - 60 * 24 * 60 * 60 * 1000;
+  const periodTotals = (start: number, end: number) => saleRows.reduce(
+    (acc, sale) => {
+      const time = new Date(sale.saleDate).getTime();
+      if (time >= start && time < end) {
+        acc.revenue += numeric(sale.revenue);
+        acc.profit += numeric(sale.profit);
+        acc.orders += 1;
+      }
+      return acc;
+    },
+    { revenue: 0, profit: 0, orders: 0 },
+  );
+  const currentPeriod = periodTotals(currentPeriodStart, now);
+  const priorPeriod = periodTotals(priorPeriodStart, currentPeriodStart);
+  const distinctCustomers = (start: number, end: number) => new Set(
+    saleRows.filter((sale) => {
+      const time = new Date(sale.saleDate).getTime();
+      return sale.customerId && time >= start && time < end;
+    }).map((sale) => sale.customerId),
+  ).size;
+  const currentCustomers = distinctCustomers(currentPeriodStart, now);
+  const priorCustomers = distinctCustomers(priorPeriodStart, currentPeriodStart);
+
   const byProduct = new Map<number, { productId: number; name: string; category: string; quantity: number; revenue: number; profit: number }>();
   const byCategory = new Map<string, number>();
   const byDate = new Map<string, number>();
@@ -255,6 +282,10 @@ export async function getDashboardSnapshot(userId: number) {
       customers: customerRows.length,
       inventoryRisk: inventoryView.filter((item) => item.status === "low" || item.status === "out").length,
       profitMargin: totals.revenue ? round((totals.profit / totals.revenue) * 100) : 0,
+      growthRevenue: calculateGrowth(currentPeriod.revenue, priorPeriod.revenue),
+      growthProfit: calculateGrowth(currentPeriod.profit, priorPeriod.profit),
+      growthOrders: calculateGrowth(currentPeriod.orders, priorPeriod.orders),
+      growthCustomers: calculateGrowth(currentCustomers, priorCustomers),
     },
     revenueSeries,
     topProducts,
@@ -284,5 +315,9 @@ export async function getCustomersForUser(userId: number) {
   const db = await getDb();
   const business = await getBusinessForUser(userId);
   if (!db || !business) return [];
-  return db.select().from(customers).where(eq(customers.businessId, business.id)).orderBy(desc(customers.updatedAt));
+  const [customerRows, saleRows] = await Promise.all([
+    db.select().from(customers).where(eq(customers.businessId, business.id)).orderBy(desc(customers.updatedAt)),
+    db.select().from(sales).where(eq(sales.businessId, business.id)).orderBy(desc(sales.saleDate)),
+  ]);
+  return aggregateCustomerMetrics(customerRows, saleRows);
 }

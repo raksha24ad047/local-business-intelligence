@@ -15,6 +15,20 @@
       "when": 1788882792713,
       "tag": "0001_colorful_thaddeus_ross",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1788887935965,
+      "tag": "0002_happy_photon",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1788888189091,
+      "tag": "0003_flashy_overlord",
+      "breakpoints": true
     }
   ]
 }

@@ -6,6 +6,7 @@ import {
   mysqlTable,
   text,
   timestamp,
+  uniqueIndex,
   varchar,
 } from "drizzle-orm/mysql-core";
 
@@ -23,7 +24,7 @@ export const users = mysqlTable("users", {
 
 export const businesses = mysqlTable("businesses", {
   id: int("id").autoincrement().primaryKey(),
-  ownerId: int("ownerId").notNull(),
+  ownerId: int("ownerId").notNull().references(() => users.id),
   name: varchar("name", { length: 160 }).notNull(),
   type: varchar("type", { length: 80 }).notNull().default("Cafe"),
   location: varchar("location", { length: 160 }),
@@ -36,7 +37,7 @@ export const businesses = mysqlTable("businesses", {
 
 export const products = mysqlTable("products", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   name: varchar("name", { length: 160 }).notNull(),
   category: varchar("category", { length: 80 }).notNull().default("General"),
   price: decimal("price", { precision: 12, scale: 2 }).notNull().default("0.00"),
@@ -48,31 +49,35 @@ export const products = mysqlTable("products", {
 
 export const inventory = mysqlTable("inventory", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
-  productId: int("productId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
+  productId: int("productId").notNull().references(() => products.id),
   currentStock: decimal("currentStock", { precision: 12, scale: 2 }).notNull().default("0.00"),
   minimumStock: decimal("minimumStock", { precision: 12, scale: 2 }).notNull().default("0.00"),
   unit: varchar("unit", { length: 24 }).notNull().default("units"),
   supplier: varchar("supplier", { length: 160 }),
   lastRestocked: timestamp("lastRestocked"),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-});
+}, (table) => ({
+  businessProductUnique: uniqueIndex("inventory_business_product_unique").on(table.businessId, table.productId),
+}));
 
 export const customers = mysqlTable("customers", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   externalId: varchar("externalId", { length: 100 }).notNull(),
   name: varchar("name", { length: 160 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-});
+}, (table) => ({
+  businessExternalIdUnique: uniqueIndex("customers_business_external_id_unique").on(table.businessId, table.externalId),
+}));
 
 export const sales = mysqlTable("sales", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   saleDate: timestamp("saleDate").notNull(),
-  productId: int("productId").notNull(),
-  customerId: int("customerId"),
+  productId: int("productId").notNull().references(() => products.id),
+  customerId: int("customerId").references(() => customers.id),
   quantity: int("quantity").notNull(),
   unitPrice: decimal("unitPrice", { precision: 12, scale: 2 }).notNull(),
   unitCost: decimal("unitCost", { precision: 12, scale: 2 }).notNull(),
@@ -80,12 +85,15 @@ export const sales = mysqlTable("sales", {
   cost: decimal("cost", { precision: 14, scale: 2 }).notNull(),
   profit: decimal("profit", { precision: 14, scale: 2 }).notNull(),
   channel: varchar("channel", { length: 40 }).default("in_store"),
+  sourceHash: varchar("sourceHash", { length: 64 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
-});
+}, (table) => ({
+  businessSourceHashUnique: uniqueIndex("sales_business_source_hash_unique").on(table.businessId, table.sourceHash),
+}));
 
 export const uploads = mysqlTable("uploads", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   fileName: varchar("fileName", { length: 255 }).notNull(),
   storageKey: varchar("storageKey", { length: 512 }),
   status: mysqlEnum("status", ["processing", "complete", "failed"]).notNull().default("processing"),
@@ -97,7 +105,7 @@ export const uploads = mysqlTable("uploads", {
 
 export const forecasts = mysqlTable("forecasts", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   horizon: varchar("horizon", { length: 40 }).notNull().default("7_days"),
   forecastDate: timestamp("forecastDate").notNull(),
   predictedRevenue: decimal("predictedRevenue", { precision: 14, scale: 2 }).notNull(),
@@ -110,7 +118,7 @@ export const forecasts = mysqlTable("forecasts", {
 
 export const alerts = mysqlTable("alerts", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   type: varchar("type", { length: 60 }).notNull(),
   severity: mysqlEnum("severity", ["info", "warning", "critical"]).notNull().default("info"),
   title: varchar("title", { length: 180 }).notNull(),
@@ -121,7 +129,7 @@ export const alerts = mysqlTable("alerts", {
 
 export const insights = mysqlTable("insights", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
   type: varchar("type", { length: 60 }).notNull(),
   title: varchar("title", { length: 180 }).notNull(),
   body: text("body").notNull(),
@@ -131,8 +139,8 @@ export const insights = mysqlTable("insights", {
 
 export const auditLogs = mysqlTable("audit_logs", {
   id: int("id").autoincrement().primaryKey(),
-  businessId: int("businessId").notNull(),
-  userId: int("userId").notNull(),
+  businessId: int("businessId").notNull().references(() => businesses.id),
+  userId: int("userId").notNull().references(() => users.id),
   action: varchar("action", { length: 120 }).notNull(),
   entityType: varchar("entityType", { length: 80 }),
   entityId: int("entityId"),

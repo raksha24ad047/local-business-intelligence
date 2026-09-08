@@ -27,9 +27,10 @@ import {
   logAudit,
 } from "./db";
 import { storagePut } from "./storage";
-import { computeSaleTotals, weightedForecast } from "./business-logic";
+import { computeSaleTotals, makeSaleSourceHash, weightedForecast } from "./business-logic";
 
-const numberInput = z.union([z.number(), z.string()]).transform((value) => Number(value));
+const numberInput = z.coerce.number().finite();
+const nonNegativeNumber = numberInput.nonnegative();
 const money = (value: number) => Math.round(value * 100) / 100;
 
 async function requireBusiness(userId: number) {
@@ -65,7 +66,7 @@ export const appRouter = router({
           type: z.string().min(2),
           location: z.string().optional(),
           currency: z.string().min(3).max(8),
-          taxRate: numberInput,
+          taxRate: nonNegativeNumber.max(100),
           openingHours: z.string().optional(),
         }),
       )
@@ -86,7 +87,7 @@ export const appRouter = router({
   products: router({
     list: protectedProcedure.query(({ ctx }) => getProductsForUser(ctx.user.id)),
     create: protectedProcedure
-      .input(z.object({ name: z.string().min(1), category: z.string().min(1), price: numberInput, cost: numberInput }))
+      .input(z.object({ name: z.string().trim().min(1), category: z.string().trim().min(1), price: nonNegativeNumber, cost: nonNegativeNumber }))
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         const business = await requireBusiness(ctx.user.id);
@@ -96,7 +97,7 @@ export const appRouter = router({
         return { success: true };
       }),
     update: protectedProcedure
-      .input(z.object({ id: z.number(), name: z.string().min(1), category: z.string().min(1), price: numberInput, cost: numberInput, active: z.boolean().optional() }))
+      .input(z.object({ id: z.number().int().positive(), name: z.string().trim().min(1), category: z.string().trim().min(1), price: nonNegativeNumber, cost: nonNegativeNumber, active: z.boolean().optional() }))
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         const business = await requireBusiness(ctx.user.id);
@@ -105,16 +106,35 @@ export const appRouter = router({
         await logAudit({ businessId: business.id, userId: ctx.user.id, action: "Updated product", entityType: "product", entityId: input.id });
         return { success: true };
       }),
+    delete: protectedProcedure
+      .input(z.object({ id: z.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const business = await requireBusiness(ctx.user.id);
+        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+        const existing = await db.select().from(products).where(and(eq(products.id, input.id), eq(products.businessId, business.id))).limit(1);
+        if (!existing[0]) throw new TRPCError({ code: "NOT_FOUND", message: "Product not found in this workspace" });
+        const linked = await db.select().from(sales).where(and(eq(sales.productId, input.id), eq(sales.businessId, business.id))).limit(1);
+        if (linked[0]) {
+          await db.update(products).set({ active: false }).where(and(eq(products.id, input.id), eq(products.businessId, business.id)));
+        } else {
+          await db.delete(products).where(and(eq(products.id, input.id), eq(products.businessId, business.id)));
+        }
+        await logAudit({ businessId: business.id, userId: ctx.user.id, action: linked[0] ? "Archived product" : "Deleted product", entityType: "product", entityId: input.id });
+        return { success: true, archived: Boolean(linked[0]) };
+      }),
   }),
 
   inventory: router({
     list: protectedProcedure.query(({ ctx }) => getInventoryForUser(ctx.user.id)),
     upsert: protectedProcedure
-      .input(z.object({ productId: z.number(), currentStock: numberInput, minimumStock: numberInput, unit: z.string().min(1), supplier: z.string().optional() }))
+      .input(z.object({ productId: z.number().int().positive(), currentStock: nonNegativeNumber, minimumStock: nonNegativeNumber, unit: z.string().trim().min(1), supplier: z.string().trim().optional() }))
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         const business = await requireBusiness(ctx.user.id);
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+        const product = await db.select().from(products).where(and(eq(products.id, input.productId), eq(products.businessId, business.id))).limit(1);
+        if (!product[0]) throw new TRPCError({ code: "NOT_FOUND", message: "Product not found in this workspace" });
         const existing = await db.select().from(inventory).where(and(eq(inventory.businessId, business.id), eq(inventory.productId, input.productId))).limit(1);
         if (existing[0]) {
           await db.update(inventory).set({ currentStock: input.currentStock.toFixed(2), minimumStock: input.minimumStock.toFixed(2), unit: input.unit, supplier: input.supplier }).where(eq(inventory.id, existing[0].id));
@@ -132,11 +152,13 @@ export const appRouter = router({
 
   sales: router({
     create: protectedProcedure
-      .input(z.object({ date: z.coerce.date(), productId: z.number(), customerExternalId: z.string().optional(), quantity: z.number().int().positive(), unitPrice: numberInput, unitCost: numberInput, channel: z.string().optional() }))
+      .input(z.object({ date: z.coerce.date(), productId: z.number().int().positive(), customerExternalId: z.string().trim().optional(), quantity: z.number().int().positive(), unitPrice: nonNegativeNumber, unitCost: nonNegativeNumber, channel: z.string().trim().optional() }))
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         const business = await requireBusiness(ctx.user.id);
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+        const product = await db.select().from(products).where(and(eq(products.id, input.productId), eq(products.businessId, business.id))).limit(1);
+        if (!product[0]) throw new TRPCError({ code: "NOT_FOUND", message: "Product not found in this workspace" });
         let customerId: number | undefined;
         if (input.customerExternalId?.trim()) {
           const externalId = input.customerExternalId.trim();
@@ -160,6 +182,13 @@ export const appRouter = router({
         const business = await requireBusiness(ctx.user.id);
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
         const buffer = Buffer.from(input.contentBase64, "base64");
+        const extension = input.fileName.toLowerCase().split(".").pop();
+        if (!extension || !["csv", "xlsx", "xls"].includes(extension)) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Only CSV, XLSX, and XLS files are supported." });
+        }
+        if (buffer.length > 15 * 1024 * 1024) {
+          throw new TRPCError({ code: "PAYLOAD_TOO_LARGE", message: "Sales files must be 15 MB or smaller." });
+        }
         let uploadId = 0;
         try {
           const stored = await storagePut(`${business.id}-uploads/${Date.now()}-${input.fileName.replace(/[^a-zA-Z0-9._-]/g, "-")}`, buffer, input.mimeType ?? "application/octet-stream");
@@ -185,7 +214,9 @@ export const appRouter = router({
           const existingCustomers = await db.select().from(customers).where(eq(customers.businessId, business.id));
           const customerCache = new Map(existingCustomers.map((customer) => [customer.externalId, customer]));
           const saleValues: Array<typeof sales.$inferInsert> = [];
+          const seenHashes = new Set<string>();
           let rejected = 0;
+          let duplicatesSkipped = 0;
           for (const row of rows.slice(1)) {
             const productName = String(row[productIndex] ?? "").trim();
             const rawDate = row[dateIndex];
@@ -209,6 +240,18 @@ export const appRouter = router({
               continue;
             }
             const externalCustomerId = customerIndex >= 0 ? String(row[customerIndex] ?? "").trim() : "";
+            const rowHash = makeSaleSourceHash({ date: parsedDate, productName, quantity, unitPrice, unitCost, customerExternalId: externalCustomerId });
+            if (seenHashes.has(rowHash)) {
+              duplicatesSkipped += 1;
+              continue;
+            }
+            const duplicate = await db.select({ id: sales.id }).from(sales).where(and(eq(sales.businessId, business.id), eq(sales.sourceHash, rowHash))).limit(1);
+            if (duplicate[0]) {
+              duplicatesSkipped += 1;
+              seenHashes.add(rowHash);
+              continue;
+            }
+            seenHashes.add(rowHash);
             let customerId: number | undefined;
             if (externalCustomerId) {
               let customer = customerCache.get(externalCustomerId);
@@ -222,12 +265,16 @@ export const appRouter = router({
             }
             const revenue = quantity * unitPrice;
             const cost = quantity * unitCost;
-            saleValues.push({ businessId: business.id, saleDate: parsedDate, productId: product.id, customerId, quantity: Math.round(quantity), unitPrice: unitPrice.toFixed(2), unitCost: unitCost.toFixed(2), revenue: revenue.toFixed(2), cost: cost.toFixed(2), profit: (revenue - cost).toFixed(2), channel: "import" });
+            saleValues.push({ businessId: business.id, saleDate: parsedDate, productId: product.id, customerId, quantity: Math.round(quantity), unitPrice: unitPrice.toFixed(2), unitCost: unitCost.toFixed(2), revenue: revenue.toFixed(2), cost: cost.toFixed(2), profit: (revenue - cost).toFixed(2), channel: "import", sourceHash: rowHash });
           }
           if (saleValues.length) await db.insert(sales).values(saleValues);
-          await db.update(uploads).set({ status: "complete", rowsProcessed: saleValues.length, rowsRejected: rejected, validationMessage: rejected ? `${rejected} rows were skipped because they had invalid dates, quantities, prices, or missing product names.` : "All rows processed successfully." }).where(eq(uploads.id, uploadId));
-          await logAudit({ businessId: business.id, userId: ctx.user.id, action: "Uploaded sales data", entityType: "upload", entityId: uploadId, metadata: { fileName: input.fileName, rowsProcessed: saleValues.length, rowsRejected: rejected } });
-          return { success: true, rowsProcessed: saleValues.length, rowsRejected: rejected };
+          const validationMessage = [
+            rejected ? `${rejected} rows rejected for invalid dates, quantities, prices, or missing product names.` : "",
+            duplicatesSkipped ? `${duplicatesSkipped} duplicate rows skipped.` : "",
+          ].filter(Boolean).join(" ") || "All rows processed successfully.";
+          await db.update(uploads).set({ status: "complete", rowsProcessed: saleValues.length, rowsRejected: rejected + duplicatesSkipped, validationMessage }).where(eq(uploads.id, uploadId));
+          await logAudit({ businessId: business.id, userId: ctx.user.id, action: "Uploaded sales data", entityType: "upload", entityId: uploadId, metadata: { fileName: input.fileName, rowsProcessed: saleValues.length, rowsRejected: rejected, duplicatesSkipped } });
+          return { success: true, rowsProcessed: saleValues.length, rowsRejected: rejected, duplicatesSkipped };
         } catch (error) {
           if (uploadId) await db.update(uploads).set({ status: "failed", validationMessage: error instanceof Error ? error.message : "Upload failed." }).where(eq(uploads.id, uploadId));
           throw new TRPCError({ code: "BAD_REQUEST", message: error instanceof Error ? error.message : "Upload failed." });
@@ -271,7 +318,7 @@ export const appRouter = router({
 
   ai: router({
     query: protectedProcedure
-      .input(z.object({ messages: z.array(z.object({ role: z.enum(["user", "assistant", "system"]), content: z.string() })).min(1) }))
+      .input(z.object({ messages: z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().trim().min(1).max(4000) })).min(1).max(20) }))
       .mutation(async ({ ctx, input }) => {
         const snapshot = await getDashboardSnapshot(ctx.user.id);
         const context = JSON.stringify({ business: snapshot.business, summary: snapshot.summary, topProducts: snapshot.topProducts, categoryMix: snapshot.categoryMix, inventory: snapshot.inventory, alerts: snapshot.alerts, forecasts: snapshot.forecasts.slice(0, 14) });
